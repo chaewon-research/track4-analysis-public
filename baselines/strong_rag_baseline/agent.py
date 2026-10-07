@@ -31,6 +31,92 @@ _QUERY_SUFFIX = "results revenue earnings guidance outlook growth"
 #: a real passage, short enough to stay inside one excerpt (chunks run to 1M characters).
 _FALLBACK_QUOTE_CHARS = 200
 
+# Whole SEC filings can be hundreds of thousands of characters long.  The
+# corpus index keeps those large spans because their offsets are authoritative,
+# but sending several complete filings to the model can overwhelm its context
+# window.  Split only the model-facing retrieval into small overlapping
+# windows while preserving each window's absolute corpus offsets.
+_PROMPT_WINDOW_CHARS = 3500
+_PROMPT_WINDOW_OVERLAP = 500
+
+
+def _prompt_windows(chunks: list[Chunk]) -> list[Chunk]:
+    """Split large retrieved chunks into citation-safe overlapping windows."""
+    windows: list[Chunk] = []
+    step = _PROMPT_WINDOW_CHARS - _PROMPT_WINDOW_OVERLAP
+
+    for chunk in chunks:
+        if len(chunk.text) <= _PROMPT_WINDOW_CHARS:
+            windows.append(chunk)
+            continue
+
+        for rel_start in range(0, len(chunk.text), step):
+            rel_end = min(rel_start + _PROMPT_WINDOW_CHARS, len(chunk.text))
+            text = chunk.text[rel_start:rel_end]
+
+            if text.strip():
+                windows.append(
+                    Chunk(
+                        doc_id=chunk.doc_id,
+                        doc_date=chunk.doc_date,
+                        span_start=chunk.span_start + rel_start,
+                        span_end=chunk.span_start + rel_end,
+                        text=text,
+                    )
+                )
+
+            if rel_end >= len(chunk.text):
+                break
+
+    return windows
+
+
+def _focused_prompt_chunks(
+    chunks: list[Chunk],
+    query: str,
+    cutoff_date: str,
+    top_k: int,
+) -> list[Chunk]:
+    """Rerank small windows from the initially retrieved documents."""
+    candidates = _prompt_windows(chunks)
+    if not candidates:
+        return []
+
+    reranked = BM25Index(candidates, cutoff_date).search(query, top_k)
+    if reranked:
+        return [item.chunk for item in reranked]
+
+    return candidates[:top_k]
+
+
+
+def _entity_bound_docs(
+    index: BM25Index,
+    entity: dict,
+    query: str,
+    top_k: int,
+) -> list[Chunk]:
+    """Prefer corpus documents explicitly bound to an entity's CIK.
+
+    SEC-based units expose a CIK in the task row and encode that same CIK in
+    EDGAR document IDs.  When that binding is available, using another
+    company's filing is always worse than restricting retrieval to the
+    entity's own eligible filings.  Non-SEC task families fall back to normal
+    BM25 document retrieval.
+    """
+    cik = re.sub(r"\D", "", str(entity.get("cik", "")))
+
+    if cik:
+        matched = [
+            chunk
+            for chunk in index.chunks
+            if cik in re.sub(r"\D", "", chunk.doc_id)
+        ]
+        if matched:
+            return matched
+
+    return [item.chunk for item in index.search(query, top_k)]
+
 
 @dataclass
 class EntityResult:
@@ -58,7 +144,11 @@ def _entity_query(entity: dict, family: str = "") -> str:
     keys = (
         "name",
         "entity_id",
+        "ticker",
+        "symbol",
         "sector",
+        "industry",
+        "cik",
         "series_id",
         "series_name",
         "agency",
@@ -67,10 +157,13 @@ def _entity_query(entity: dict, family: str = "") -> str:
     )
     parts = [str(entity.get(key, "")) for key in keys if entity.get(key)]
 
-    # The stock-oriented default suffix is actively harmful for macro
-    # revision tasks, where we want vintage/revision evidence instead.
     if family == "macro_revision_direction":
         suffix = "revision estimate vintage release"
+    elif family == "credit_event":
+        suffix = (
+            "liquidity debt cash covenant default going concern "
+            "losses maturities solvency"
+        )
     else:
         suffix = _QUERY_SUFFIX
 
@@ -93,7 +186,13 @@ def _ground_claims(
         if not isinstance(item, dict):
             dropped += 1
             continue
-        doc_id = item.get("doc_id", "")
+        doc_id = str(item.get("doc_id", "")).strip()
+        # Some OpenAI-compatible local models echo the prompt syntax as
+        # "doc_id=EDGAR_..." rather than the bare identifier. This is an
+        # unambiguous formatting error, so normalize only that exact prefix.
+        if doc_id.startswith("doc_id="):
+            doc_id = doc_id[len("doc_id="):].strip()
+
         quote = str(item.get("quote", ""))
         claim_text = str(item.get("claim", "")).strip()
         doc_text = corpus.doc_texts.get(doc_id)
@@ -317,7 +416,14 @@ def run_entity(
     client: ModelClient,
     top_k: int,
 ) -> EntityResult:
-    retrieved = [s.chunk for s in index.search(_entity_query(entity, task.get("family", "")), top_k)]
+    query = _entity_query(entity, task.get("family", ""))
+    retrieved_docs = _entity_bound_docs(index, entity, query, top_k)
+    retrieved = _focused_prompt_chunks(
+        retrieved_docs,
+        query,
+        task.get("cutoff_date", ""),
+        top_k,
+    )
     entity_id = entity.get("entity_id", "")
     try:
         raw = client.complete(
