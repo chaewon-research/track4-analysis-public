@@ -52,12 +52,29 @@ def _parse_model_json(raw: str) -> dict:
     return json.loads(match.group(0))
 
 
-def _entity_query(entity: dict) -> str:
-    parts = [
-        str(entity.get(key, ""))
-        for key in ("name", "entity_id", "sector", "series_id", "description")
-    ]
-    return " ".join(p for p in parts if p) + " " + _QUERY_SUFFIX
+def _entity_query(entity: dict, family: str = "") -> str:
+    # Use the richest entity-specific metadata available so BM25 retrieves
+    # evidence for the correct company / macro series / instrument.
+    keys = (
+        "name",
+        "entity_id",
+        "sector",
+        "series_id",
+        "series_name",
+        "agency",
+        "description",
+        "ref_month",
+    )
+    parts = [str(entity.get(key, "")) for key in keys if entity.get(key)]
+
+    # The stock-oriented default suffix is actively harmful for macro
+    # revision tasks, where we want vintage/revision evidence instead.
+    if family == "macro_revision_direction":
+        suffix = "revision estimate vintage release"
+    else:
+        suffix = _QUERY_SUFFIX
+
+    return " ".join(parts + [suffix])
 
 
 def _ground_claims(
@@ -300,7 +317,7 @@ def run_entity(
     client: ModelClient,
     top_k: int,
 ) -> EntityResult:
-    retrieved = [s.chunk for s in index.search(_entity_query(entity), top_k)]
+    retrieved = [s.chunk for s in index.search(_entity_query(entity, task.get("family", "")), top_k)]
     entity_id = entity.get("entity_id", "")
     try:
         raw = client.complete(
