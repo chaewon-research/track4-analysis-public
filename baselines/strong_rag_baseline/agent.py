@@ -14,6 +14,8 @@ import re
 import sys
 from dataclasses import dataclass
 
+from qfbench2_track_analysis.numeric import claim_number_status
+
 from .client import ModelBudgetExhausted, ModelCallError, ModelClient
 from .indexer import Chunk, IndexedCorpus
 from .prompts import SYSTEM_PROMPT, build_user_prompt
@@ -243,6 +245,16 @@ def _ground_claims(
                 dropped += 1
                 continue
             span = (chunk.span_start, chunk.span_end)
+
+        span_text = doc_text[span[0]:span[1]]
+
+        # Match the scorer's deterministic numeric backstop. If the model
+        # states a figure that is anchored nowhere in its cited passage,
+        # replace the risky claim with a short verbatim claim from that
+        # already-grounded span.
+        if claim_number_status(claim_text, [span_text]) == "unanchored":
+            claims.append(_verbatim_claim(doc_id, span_text, span[0]))
+            continue
 
         claims.append(
             {
