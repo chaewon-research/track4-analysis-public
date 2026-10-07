@@ -92,18 +92,43 @@ def _focused_prompt_chunks(
 
 def _entity_bound_docs(
     index: BM25Index,
+    corpus: IndexedCorpus,
     entity: dict,
     query: str,
     top_k: int,
 ) -> list[Chunk]:
-    """Prefer corpus documents explicitly bound to an entity's CIK.
+    """Prefer authoritative entity-bound documents before global BM25.
 
-    SEC-based units expose a CIK in the task row and encode that same CIK in
-    EDGAR document IDs.  When that binding is available, using another
-    company's filing is always worse than restricting retrieval to the
-    entity's own eligible filings.  Non-SEC task families fall back to normal
-    BM25 document retrieval.
+    Priority:
+      1. corpus manifest entity_ids binding;
+      2. SEC CIK encoded in the document ID;
+      3. ordinary corpus-wide BM25.
     """
+    entity_id = str(entity.get("entity_id", ""))
+
+    # Public corpus manifests can explicitly bind documents to roster entities.
+    # When such a binding exists, do not let another entity's document compete.
+    if entity_id and corpus.doc_entity_ids:
+        matched = [
+            chunk
+            for chunk in index.chunks
+            if entity_id in corpus.doc_entity_ids.get(
+                chunk.doc_id, frozenset()
+            )
+        ]
+        if matched:
+            # `matched` came from index.chunks, so the cutoff was already
+            # enforced. Still run BM25 inside the bound subset rather than
+            # bypassing search entirely. This preserves the normal
+            # no-retrieval fallback behavior while preventing other entities'
+            # documents from competing.
+            bound_index = BM25Index(matched, "9999-12-31")
+            return [
+                item.chunk
+                for item in bound_index.search(query, top_k)
+            ]
+
+    # SEC fallback: task rows expose a CIK and EDGAR doc IDs encode it.
     cik = re.sub(r"\D", "", str(entity.get("cik", "")))
 
     if cik:
@@ -113,7 +138,16 @@ def _entity_bound_docs(
             if cik in re.sub(r"\D", "", chunk.doc_id)
         ]
         if matched:
-            return matched
+            # `matched` came from index.chunks, so the cutoff was already
+            # enforced. Still run BM25 inside the bound subset rather than
+            # bypassing search entirely. This preserves the normal
+            # no-retrieval fallback behavior while preventing other entities'
+            # documents from competing.
+            bound_index = BM25Index(matched, "9999-12-31")
+            return [
+                item.chunk
+                for item in bound_index.search(query, top_k)
+            ]
 
     return [item.chunk for item in index.search(query, top_k)]
 
@@ -417,7 +451,9 @@ def run_entity(
     top_k: int,
 ) -> EntityResult:
     query = _entity_query(entity, task.get("family", ""))
-    retrieved_docs = _entity_bound_docs(index, entity, query, top_k)
+    retrieved_docs = _entity_bound_docs(
+        index, corpus, entity, query, top_k
+    )
     retrieved = _focused_prompt_chunks(
         retrieved_docs,
         query,
