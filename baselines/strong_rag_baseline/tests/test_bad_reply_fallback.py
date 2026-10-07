@@ -233,25 +233,50 @@ def test_the_ranking_prompt_does_not_ask_for_a_rank() -> None:
 
 
 @pytest.mark.parametrize("point", [None, "n/a"], ids=["null", "string"])
-def test_a_classification_reply_without_a_number_leaves_point_forecast_out(
+def test_probability_classification_repairs_missing_point_forecast(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: object
 ) -> None:
-    """`point_forecast` is optional on a classification unit, but a null one fails the schema
-    for the whole submission: the key is left out and the model's label and interval are kept."""
+    """A classification task that explicitly requests a probability gets a neutral
+    numeric fallback and a valid probability interval when the model omits the number."""
     task = json.loads((CLASSIFICATION_UNIT / "task.json").read_text(encoding="utf-8"))
+    assert "point_forecast" in task["prompt"].lower()
+    assert "probability" in task["prompt"].lower()
+
     label = task["target"]["labels"][-1]
     victim = _first_entity(CLASSIFICATION_UNIT)
+
     reply = json.dumps(
-        {"label": label, "point_forecast": point,
-         "interval": {"level": 0.9, "lo": 0.0, "hi": 2.0}, "evidence": []}
+        {
+            "label": label,
+            "point_forecast": point,
+            "interval": {"level": 0.9, "lo": 0.0, "hi": 2.0},
+            "evidence": [],
+        }
     )
-    answer = _run(CLASSIFICATION_UNIT, tmp_path / "a.json", monkeypatch, bad={victim: reply})
+
+    answer = _run(
+        CLASSIFICATION_UNIT,
+        tmp_path / "a.json",
+        monkeypatch,
+        bad={victim: reply},
+    )
+
     _assert_schema_valid(answer, CLASSIFICATION_UNIT)
     assert answer["notes"]["fallback_entities"] == []
-    [row] = [r for r in answer["entity_predictions"] if r["entity_id"] == victim]
-    assert "point_forecast" not in row
+
+    [row] = [
+        r
+        for r in answer["entity_predictions"]
+        if r["entity_id"] == victim
+    ]
+
+    assert row["point_forecast"] == 0.5
     assert row["label"] == label
-    assert row["interval"] == {"level": 0.9, "lo": 0.0, "hi": 2.0}
+    assert row["interval"] == {
+        "level": task.get("interval_level", 0.90),
+        "lo": 0.0,
+        "hi": 1.0,
+    }
 
 
 @pytest.mark.parametrize("unit", [CLASSIFICATION_UNIT, REGRESSION_UNIT, RANKING_UNIT],

@@ -300,6 +300,161 @@ def _finite_number(value: object) -> bool:
         return False
 
 
+_CHANGE_TARGET_TERMS = (
+    "change",
+    "growth",
+    "delta",
+    "revision",
+    "return",
+    "mom",
+    "yoy",
+)
+
+_LEVEL_FEATURE_HINTS = (
+    "current",
+    "start",
+    "level",
+    "latest",
+    "prior",
+    "net_pct",
+    "net_noncommercial",
+    "open_interest",
+    "estimate",
+    "close",
+)
+
+
+def _change_target_anchor(
+    task: dict,
+    entity: dict,
+    point: float,
+) -> float | None:
+    """Repair only an obvious level-copy error on a change-like target.
+
+    The model remains authoritative unless its forecast exactly copies a
+    level-like ENTITY feature while the same row supplies a historical
+    change-like numeric feature. In that narrow case, the historical change
+    is a safer semantic baseline than a value in the wrong quantity.
+    """
+    target = task.get("target") or {}
+    target_name = str(target.get("name", "")).lower()
+
+    if not any(term in target_name for term in _CHANGE_TARGET_TERMS):
+        return None
+
+    change_candidates: list[tuple[int, float]] = []
+    target_tokens = set(re.findall(r"[a-z0-9]+", target_name))
+
+    for key, value in entity.items():
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+        ):
+            continue
+
+        key_lower = str(key).lower()
+        if any(term in key_lower for term in _CHANGE_TARGET_TERMS):
+            key_tokens = set(re.findall(r"[a-z0-9]+", key_lower))
+            overlap = len(target_tokens & key_tokens)
+            change_candidates.append((overlap, float(value)))
+
+    if not change_candidates:
+        return None
+
+    copied_level = False
+
+    for key, value in entity.items():
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+        ):
+            continue
+
+        key_lower = str(key).lower()
+
+        if any(term in key_lower for term in _CHANGE_TARGET_TERMS):
+            continue
+
+        if not any(hint in key_lower for hint in _LEVEL_FEATURE_HINTS):
+            continue
+
+        if math.isclose(
+            point,
+            float(value),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            copied_level = True
+            break
+
+    if not copied_level:
+        return None
+
+    # Prefer the historical-change field whose name most closely matches
+    # the target name. Stable max preserves entity-field order on ties.
+    return max(change_candidates, key=lambda item: item[0])[1]
+
+
+def _semantic_numeric_baseline(
+    task: dict,
+    entity: dict,
+) -> float | None:
+    """Find a same-semantic historical numeric feature for a safe fallback.
+
+    A candidate must share a target-semantic operator such as change, growth,
+    MoM, YoY, return, revision, delta, or ratio. This prevents using a level
+    such as start_yield_pct as the fallback for a yield-change target while
+    allowing fields such as latest_published_mom_pct for a MoM target.
+    """
+    target = task.get("target") or {}
+    target_name = str(target.get("name", "")).lower()
+    target_tokens = set(re.findall(r"[a-z0-9]+", target_name))
+
+    semantic_tokens = set(_CHANGE_TARGET_TERMS) | {"ratio"}
+    required = target_tokens & semantic_tokens
+
+    if not required:
+        return None
+
+    candidates: list[tuple[int, int, float]] = []
+
+    for key, value in entity.items():
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+        ):
+            continue
+
+        key_tokens = set(
+            re.findall(r"[a-z0-9]+", str(key).lower())
+        )
+
+        shared_semantics = required & key_tokens
+        if not shared_semantics:
+            continue
+
+        total_overlap = len(target_tokens & key_tokens)
+
+        candidates.append(
+            (
+                len(shared_semantics),
+                total_overlap,
+                float(value),
+            )
+        )
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda item: (item[0], item[1]),
+    )[2]
+
+
 def _interval_problem(parsed: dict) -> str | None:
     """Why the model's interval cannot be used as given, or None when it can."""
     interval = parsed.get("interval") or {}
@@ -318,7 +473,18 @@ def _interval_problem(parsed: dict) -> str | None:
 def _safe_interval(parsed: dict, level: float, point: float | None) -> dict:
     if _interval_problem(parsed) is None:
         interval = parsed["interval"]
-        return {"level": level, "lo": float(interval["lo"]), "hi": float(interval["hi"])}
+        lo = float(interval["lo"])
+        hi = float(interval["hi"])
+
+        # A prediction interval should contain its own point forecast. Models
+        # occasionally emit a numerically valid band shifted away from the point;
+        # minimally expand the nearest endpoint rather than discarding the band.
+        if _finite_number(point):
+            point_value = float(point)
+            lo = min(lo, point_value)
+            hi = max(hi, point_value)
+
+        return {"level": level, "lo": lo, "hi": hi}
     # Fallback: wide symmetric band around the point forecast (or zero). A missing
     # lo/hi is not a per-entity coverage penalty -- it fails g1_schema and the WHOLE
     # submission is scored t4.schema_invalid at W = -0.27 -- so any sane band beats none.
@@ -400,10 +566,19 @@ def _fallback_prediction(
     """
     target = task.get("target", {})
     labels = target.get("labels") or []
+
+    fallback_point = _semantic_numeric_baseline(task, entity)
+    if fallback_point is None:
+        fallback_point = 0.0
+
     prediction: dict = {
         "entity_id": entity.get("entity_id", ""),
-        "point_forecast": 0.0,
-        "interval": _safe_interval({}, task.get("interval_level", 0.90), 0.0),
+        "point_forecast": fallback_point,
+        "interval": _safe_interval(
+            {},
+            task.get("interval_level", 0.90),
+            fallback_point,
+        ),
         "claims": _fallback_claims(task, corpus, retrieved),
     }
     if labels:
@@ -431,8 +606,73 @@ def _prediction_from_reply(
     _require_finite(point, "point_forecast")
     point_value = float(point) if isinstance(point, (int, float)) else None
     if point_value is None and target.get("type") in ("regression", "ranking"):
-        # The scorer refuses the whole submission when this row has no number.
-        raise ValueError("model reply carries no numeric point_forecast")
+        point_value = _semantic_numeric_baseline(task, entity)
+
+        if point_value is None:
+            # The scorer refuses the whole submission when this row has no number.
+            raise ValueError("model reply carries no numeric point_forecast")
+
+    # Some classification tasks explicitly define point_forecast as a
+    # probability. Enforce that numeric contract even when a model returns
+    # null or an unrelated numeric interval. A neutral 0.5 is safer than
+    # inventing directional confidence when the model supplied none.
+    task_text = str(task.get("prompt", "")).lower()
+    probability_task = (
+        target.get("type") == "classification"
+        and "point_forecast" in task_text
+        and "probability" in task_text
+    )
+
+    if probability_task:
+        if point_value is None or not (0.0 <= point_value <= 1.0):
+            point_value = 0.5
+
+        interval = parsed.get("interval") or {}
+        lo = interval.get("lo")
+        hi = interval.get("hi")
+
+        if (
+            not _finite_number(lo)
+            or not _finite_number(hi)
+            or float(lo) < 0.0
+            or float(hi) > 1.0
+            or float(lo) > float(hi)
+        ):
+            parsed["interval"] = {
+                "level": task.get("interval_level", 0.90),
+                "lo": 0.0,
+                "hi": 1.0,
+            }
+        else:
+            parsed["interval"] = {
+                **interval,
+                "lo": min(float(lo), point_value),
+                "hi": max(float(hi), point_value),
+            }
+
+    if point_value is not None:
+        semantic_anchor = _change_target_anchor(task, entity, point_value)
+        if semantic_anchor is not None and not math.isclose(
+            semantic_anchor,
+            point_value,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            old_point = point_value
+            point_value = semantic_anchor
+
+            # If the model supplied a valid interval around the wrong level,
+            # translate that interval by the same amount rather than leaving
+            # it centered on a quantity we just rejected.
+            if _interval_problem(parsed) is None:
+                interval = parsed["interval"]
+                delta = point_value - old_point
+                parsed["interval"] = {
+                    **interval,
+                    "lo": float(interval["lo"]) + delta,
+                    "hi": float(interval["hi"]) + delta,
+                }
+
     claims, dropped = _ground_claims(
         parsed.get("evidence") or [], corpus, retrieved
     )

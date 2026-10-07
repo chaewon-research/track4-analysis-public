@@ -13,10 +13,17 @@ import json
 from .indexer import Chunk
 
 SYSTEM_PROMPT = """\
-You are a careful financial analyst. You predict a target for one entity using ONLY the
-evidence excerpts provided — no outside knowledge about events after the stated cutoff date.
-You must respond with a single JSON object and nothing else. Every evidence quote you return
-must be copied verbatim, character for character, from one of the provided excerpts."""
+You are a careful financial analyst. Predict the target using the TASK statement,
+the ENTITY fields, and the pre-cutoff EVIDENCE EXCERPTS. ENTITY fields are valid predictive
+inputs and should be used when informative. Do not use outside knowledge about events after
+the stated cutoff date.
+
+Evidence claims are stricter than the forecast itself: every claim must be supported by its
+cited EVIDENCE EXCERPT, and every evidence quote must be copied verbatim, character for
+character, from that excerpt. Do not cite an ENTITY field as evidence unless the same fact
+also appears in a provided excerpt.
+
+You must respond with a single JSON object and nothing else."""
 
 _TARGET_INSTRUCTIONS = {
     "classification": (
@@ -54,6 +61,76 @@ def build_user_prompt(
         if key in ("corpus_ref",):
             continue
         lines.append(f"  {key}: {value}")
+
+    lines.append("\nPOINT_FORECAST SEMANTICS:")
+    lines.append(
+        f"- Predict exactly this TARGET quantity: {target.get('name', '')}"
+    )
+
+    entity_unit = entity.get("unit")
+    if entity_unit:
+        lines.append(
+            f"- Required numeric unit for point_forecast: {entity_unit}"
+        )
+
+    lines.append(
+        "- point_forecast is the FUTURE/RESOLUTION target requested by the TASK. "
+        "Do not simply copy a current level, starting value, historical observation, "
+        "raw count, or lagged/trailing feature unless that value is genuinely your "
+        "forecast of the requested target."
+    )
+
+    if target_type == "ranking":
+        lines.append(
+            "- For ranking tasks, point_forecast is the predicted TARGET METRIC value, "
+            "NOT the integer rank. The scorer derives the ranking from these values."
+        )
+
+    if target_type == "regression":
+        lines.append(
+            "- For regression tasks, preserve the target's requested scale and units. "
+            "For example, a change target requires a predicted change, not the ending "
+            "level or the starting level."
+        )
+
+    target_name_lower = str(target.get("name", "")).lower()
+    change_terms = (
+        "change",
+        "growth",
+        "delta",
+        "revision",
+        "return",
+        "mom",
+        "yoy",
+    )
+
+    if any(term in target_name_lower for term in change_terms):
+        lines.append(
+            "- IMPORTANT: this TARGET is a change/growth/delta-type quantity. "
+            "A current or starting LEVEL is NOT a valid point_forecast simply because "
+            "it has related units."
+        )
+
+        change_features = []
+        for key, value in entity.items():
+            key_lower = str(key).lower()
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and any(term in key_lower for term in change_terms)
+            ):
+                change_features.append(f"{key}={value}")
+
+        if change_features:
+            lines.append(
+                "- Historical change-like ENTITY features that may be useful as "
+                "forecast anchors (they are inputs, NOT known future outcomes): "
+                + ", ".join(change_features)
+            )
+            lines.append(
+                "- Prefer reasoning from these change-like historical features over "
+                "copying a level field when forecasting another change."
+            )
 
     lines.append("\nEVIDENCE EXCERPTS (cite only these):")
     for i, chunk in enumerate(retrieved, 1):
