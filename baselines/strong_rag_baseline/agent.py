@@ -12,7 +12,7 @@ import json
 import math
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from qfbench2_track_analysis.numeric import claim_number_status
 
@@ -252,7 +252,18 @@ def _ground_claims(
         # states a figure that is anchored nowhere in its cited passage,
         # replace the risky claim with a short verbatim claim from that
         # already-grounded span.
-        if claim_number_status(claim_text, [span_text]) == "unanchored":
+        # Match scorer 5.2.x: every numeric figure in an extractive
+        # evidence claim must be anchored in its cited passage. If any figure
+        # is unsupported, replace the risky model-written claim with a short
+        # verbatim claim from the already-grounded span.
+        if (
+            claim_number_status(
+                claim_text,
+                [span_text],
+                rule="every",
+            )
+            == "unanchored"
+        ):
             claims.append(_verbatim_claim(doc_id, span_text, span[0]))
             continue
 
@@ -454,6 +465,108 @@ def _prediction_from_reply(
     return prediction, dropped, fallback_claim, interval_problem
 
 
+def _focus_cpi_component_chunks(
+    chunks: list[Chunk],
+    entity: dict,
+) -> list[Chunk]:
+    """Focus shared CPI documents on the requested component.
+
+    CPI component tasks can contain shared tables/releases covering many
+    components. Smaller models can latch onto a nearby component or a number
+    expressed in different units. Preserve exact document offsets while
+    exposing the locally relevant part of each source.
+    """
+    name = str(entity.get("name", "")).strip()
+    series = str(entity.get("series_fred", "")).strip()
+
+    if not name and not series:
+        return chunks
+
+    focused: list[Chunk] = []
+
+    for chunk in chunks:
+        text = chunk.text
+
+        if not text:
+            focused.append(chunk)
+            continue
+
+        # The frozen ALFRED CPI table includes one derived summary line per
+        # component. Prefer that concise, component-specific history whenever
+        # it is available.
+        if name:
+            prefix = f"- {name}:".lower()
+            cursor = 0
+            note_span = None
+
+            for line in text.splitlines(keepends=True):
+                stripped = line.lstrip()
+                if stripped.lower().startswith(prefix):
+                    leading = len(line) - len(stripped)
+                    start = cursor + leading
+                    end = cursor + len(line.rstrip("\r\n"))
+                    note_span = (start, end)
+                    break
+                cursor += len(line)
+
+            if note_span is not None:
+                start, end = note_span
+                focused.append(
+                    replace(
+                        chunk,
+                        text=text[start:end],
+                        span_start=chunk.span_start + start,
+                        span_end=chunk.span_start + end,
+                    )
+                )
+                continue
+
+        # Generic fallback for BLS releases or held-out CPI documents:
+        # center the excerpt around the latest occurrence of the component
+        # name or its FRED series identifier.
+        lowered = text.lower()
+        anchors: list[int] = []
+
+        for needle in (name, series):
+            needle = needle.lower().strip()
+            if not needle:
+                continue
+            pos = lowered.rfind(needle)
+            if pos >= 0:
+                anchors.append(pos)
+
+        if not anchors:
+            focused.append(chunk)
+            continue
+
+        anchor = max(anchors)
+        start = max(0, anchor - 500)
+        end = min(len(text), anchor + 1000)
+
+        previous_newline = text.rfind("\n", 0, start)
+        if previous_newline >= 0:
+            start = previous_newline + 1
+
+        next_newline = text.find("\n", end)
+        if next_newline >= 0:
+            end = next_newline
+
+        if end <= start:
+            focused.append(chunk)
+            continue
+
+        focused.append(
+            replace(
+                chunk,
+                text=text[start:end],
+                span_start=chunk.span_start + start,
+                span_end=chunk.span_start + end,
+            )
+        )
+
+    return focused
+
+
 def run_entity(
     task: dict,
     entity: dict,
@@ -472,7 +585,44 @@ def run_entity(
         task.get("cutoff_date", ""),
         top_k,
     )
-    entity_id = entity.get("entity_id", "")
+
+    # CPI component tasks sometimes include gasoline market-price series as a
+    # useful leading indicator for gasoline/energy. For unrelated components,
+    # that differently-scaled series can distract smaller models into
+    # predicting dollars-per-gallon instead of CPI month-over-month percent.
+    family = str(task.get("family", "")).lower()
+    entity_id = str(entity.get("entity_id", ""))
+    entity_name = str(entity.get("name", "")).strip().lower()
+
+    # A gasoline-price proxy is directly useful for gasoline, the aggregate
+    # energy index, and headline/all-items CPI. Exclude it from unrelated CPI
+    # components so a differently-scaled market-price series does not dominate
+    # the component forecast. Infer this from semantic metadata rather than
+    # public-unit entity IDs so the behavior transfers to held-out entities.
+    gasoline_proxy_relevant = (
+        "gasoline" in entity_name
+        or entity_name in {"energy", "energy index"}
+        or (
+            ("all items" in entity_name or "headline" in entity_name)
+            and "less food and energy" not in entity_name
+            and "core" not in entity_name
+        )
+    )
+
+    if family == "cpi_component_nowcast" and not gasoline_proxy_relevant:
+        filtered = [
+            chunk
+            for chunk in retrieved
+            if not (
+                "gasregw" in chunk.doc_id.lower()
+                or "regular gasoline retail price" in chunk.text.lower()
+            )
+        ]
+        if filtered:
+            retrieved = filtered
+
+    if family == "cpi_component_nowcast":
+        retrieved = _focus_cpi_component_chunks(retrieved, entity)
     try:
         raw = client.complete(
             SYSTEM_PROMPT, build_user_prompt(task, entity, retrieved)

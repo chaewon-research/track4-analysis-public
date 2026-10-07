@@ -63,12 +63,15 @@ def build_user_prompt(
     # Keep the requested output contract extremely explicit. Smaller local
     # models in particular can otherwise copy exhibit numbers such as "10.1"
     # as document IDs or treat required classification fields as optional.
-    point_instruction = "number or null"
-    if target_type == "classification":
+    if target_type in ("regression", "ranking"):
+        point_instruction = "REQUIRED finite number; never null"
+    elif target_type == "classification":
         point_instruction = (
             "number if the TASK requests a numeric point_forecast/probability; "
             "otherwise null"
         )
+    else:
+        point_instruction = "number or null"
 
     schema = {
         "label": (
@@ -99,6 +102,8 @@ def build_user_prompt(
     lines.append(
         "\nSTRICT OUTPUT RULES:\n"
         "- Never return null for label on a classification task.\n"
+        "- For regression and ranking tasks, point_forecast MUST be a finite "
+        "number and MUST NEVER be null.\n"
         "- Copy doc_id EXACTLY from an EVIDENCE EXCERPT header. Do not add "
         '"doc_id=", an excerpt number, an exhibit number, or any other prefix.\n'
         "- Return exactly ONE evidence entry: the strongest directly supported "
