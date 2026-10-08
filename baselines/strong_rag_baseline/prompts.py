@@ -104,7 +104,9 @@ def build_user_prompt(
         "yoy",
     )
 
-    if any(term in target_name_lower for term in change_terms):
+    if target_type in ("regression", "ranking") and any(
+        term in target_name_lower for term in change_terms
+    ):
         lines.append(
             "- IMPORTANT: this TARGET is a change/growth/delta-type quantity. "
             "A current or starting LEVEL is NOT a valid point_forecast simply because "

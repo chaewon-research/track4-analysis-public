@@ -337,6 +337,8 @@ def _change_target_anchor(
     is a safer semantic baseline than a value in the wrong quantity.
     """
     target = task.get("target") or {}
+    if target.get("type") not in ("regression", "ranking"):
+        return None
     target_name = str(target.get("name", "")).lower()
 
     if not any(term in target_name for term in _CHANGE_TARGET_TERMS):
@@ -409,6 +411,8 @@ def _semantic_numeric_baseline(
     allowing fields such as latest_published_mom_pct for a MoM target.
     """
     target = task.get("target") or {}
+    if target.get("type") not in ("regression", "ranking"):
+        return None
     target_name = str(target.get("name", "")).lower()
     target_tokens = set(re.findall(r"[a-z0-9]+", target_name))
 
