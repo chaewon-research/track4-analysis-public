@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 
 from qfbench2_track_analysis.numeric import claim_number_status
 
+from .auction_history import auction_mean6_fallback
 from .client import ModelBudgetExhausted, ModelCallError, ModelClient
 from .indexer import Chunk, IndexedCorpus
 from .prompts import SYSTEM_PROMPT, build_user_prompt
@@ -571,7 +572,9 @@ def _fallback_prediction(
     target = task.get("target", {})
     labels = target.get("labels") or []
 
-    fallback_point = _semantic_numeric_baseline(task, entity)
+    fallback_point = auction_mean6_fallback(task, entity, corpus)
+    if fallback_point is None:
+        fallback_point = _semantic_numeric_baseline(task, entity)
     if fallback_point is None:
         fallback_point = 0.0
 
@@ -610,7 +613,9 @@ def _prediction_from_reply(
     _require_finite(point, "point_forecast")
     point_value = float(point) if isinstance(point, (int, float)) else None
     if point_value is None and target.get("type") in ("regression", "ranking"):
-        point_value = _semantic_numeric_baseline(task, entity)
+        point_value = auction_mean6_fallback(task, entity, corpus)
+        if point_value is None:
+            point_value = _semantic_numeric_baseline(task, entity)
 
         if point_value is None:
             # The scorer refuses the whole submission when this row has no number.
