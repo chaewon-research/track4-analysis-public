@@ -195,6 +195,8 @@ def _entity_query(entity: dict, family: str = "") -> str:
 
     if family == "macro_revision_direction":
         suffix = "revision estimate vintage release"
+    elif family == "auction_demand":
+        suffix = "Treasury auction bid cover ratio tendered accepted demand"
     elif family == "credit_event":
         suffix = (
             "liquidity debt cash covenant default going concern "
