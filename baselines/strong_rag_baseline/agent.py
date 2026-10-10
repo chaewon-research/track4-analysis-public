@@ -174,9 +174,11 @@ def _parse_model_json(raw: str) -> dict:
     return json.loads(match.group(0))
 
 
-def _entity_query(entity: dict, family: str = "") -> str:
-    # Use the richest entity-specific metadata available so BM25 retrieves
-    # evidence for the correct company / macro series / instrument.
+def _entity_query(
+    entity: dict, family: str = "", target_name: str = ""
+) -> str:
+    # Keep entity identifiers in every query, so relevant documents for a
+    # different company or instrument cannot dominate retrieval.
     keys = (
         "name",
         "entity_id",
@@ -193,6 +195,8 @@ def _entity_query(entity: dict, family: str = "") -> str:
     )
     parts = [str(entity.get(key, "")) for key in keys if entity.get(key)]
 
+    # Preserve V5's three targeted queries exactly. In particular, the
+    # Treasury auction query was part of the best-scoring V5 submission.
     if family == "macro_revision_direction":
         suffix = "revision estimate vintage release"
     elif family == "auction_demand":
@@ -202,8 +206,27 @@ def _entity_query(entity: dict, family: str = "") -> str:
             "liquidity debt cash covenant default going concern "
             "losses maturities solvency"
         )
+    elif family == "cpi_component_nowcast":
+        suffix = "CPI consumer price index component monthly inflation seasonally adjusted"
+    elif family == "rate_curve_cross_section":
+        suffix = "FOMC Federal Reserve Treasury yield interest rate maturity policy projections"
+    elif family == "positioning_shift":
+        suffix = "CFTC commitments traders noncommercial futures net positions open interest"
+    elif family in ("eps_growth_regression", "eps_yoy_direction"):
+        suffix = "GAAP diluted EPS earnings per share quarterly net income"
     else:
         suffix = _QUERY_SUFFIX
+
+    # Hidden task families often have new names. Add a few words from the
+    # *declared target*, not the post-cutoff answer, to find relevant evidence.
+    # Leave V5's proven auction/revision/credit searches completely unchanged.
+    if family not in ("macro_revision_direction", "auction_demand", "credit_event"):
+        target_terms = [
+            word for word in re.findall(r"[a-z]+", target_name.lower())
+            if len(word) > 2
+            and word not in {"change", "direction", "forecast", "rank", "pct", "first"}
+        ]
+        parts.extend(target_terms[:5])
 
     return " ".join(parts + [suffix])
 
@@ -577,7 +600,9 @@ def run_entity(
     client: ModelClient,
     top_k: int,
 ) -> EntityResult:
-    query = _entity_query(entity, task.get("family", ""))
+    query = _entity_query(
+        entity, task.get("family", ""), str(task.get("target", {}).get("name", ""))
+    )
     retrieved_docs = _entity_bound_docs(
         index, corpus, entity, query, top_k
     )
