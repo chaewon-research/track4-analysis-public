@@ -462,8 +462,20 @@ def _prediction_from_reply(
     if labels and label not in labels:
         label = labels[0]  # deterministic fallback for off-vocabulary labels
 
+    # Preserve the old behavior for malformed interval *objects*: the existing
+    # unit tests require a whole-row fallback in that case. Missing bounds or
+    # invalid numeric bounds can still use the valid-point interval fallback.
+    if "interval" in parsed and not isinstance(parsed["interval"], dict):
+        raise ValueError("model reply interval is not an object")
+
     point = parsed.get("point_forecast")
-    _require_finite(point, "point_forecast")
+    # A numeric point is optional for pure classification tasks. In particular,
+    # placeholder strings such as "n/a" must be omitted, not turn the entire
+    # otherwise-usable label prediction into a fallback row.
+    if target.get("type") in ("regression", "ranking"):
+        _require_finite(point, "point_forecast")
+    elif isinstance(point, (int, float)):
+        _require_finite(point, "point_forecast")
     point_value = _coerce_finite_number(point)
     if point_value is None and target.get("type") in ("regression", "ranking"):
         # The scorer refuses the whole submission when this row has no number.
