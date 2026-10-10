@@ -167,11 +167,24 @@ class EntityResult:
 
 
 def _parse_model_json(raw: str) -> dict:
-    """Extract the first JSON object from the model reply (tolerates fences)."""
-    match = _JSON_BLOCK.search(raw)
-    if match is None:
-        raise ValueError("model reply contains no JSON object")
-    return json.loads(match.group(0))
+    """Recover one prediction object even when extra text surrounds the reply.
+
+    Greedy ``{.*}`` fails on replies with multiple brace-delimited objects (for
+    example, analysis text followed by a JSON answer). ``raw_decode`` reads one
+    complete object at a time and does not join unrelated braces. We prefer the
+    first object that contains a prediction field, not an arbitrary example.
+    """
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", raw):
+        try:
+            candidate, _end = decoder.raw_decode(raw, match.start())
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(candidate, dict) and (
+            "point_forecast" in candidate or "label" in candidate
+        ):
+            return candidate
+    raise ValueError("model reply contains no usable prediction JSON object")
 
 
 def _entity_query(entity: dict, family: str = "") -> str:
@@ -292,39 +305,62 @@ def _best_chunk(quote: str, chunks: list[Chunk]) -> Chunk | None:
     return best[1] if best and best[0] > 0 else None
 
 
-def _finite_number(value: object) -> bool:
-    """A number that converts to a finite float (not NaN, not infinite, not too large)."""
-    if not isinstance(value, (int, float)):
-        return False
+def _coerce_finite_number(value: object) -> float | None:
+    """Accept finite JSON numbers and plainly formatted numeric strings only.
+
+    Some House-compatible models serialize a numeric value as a string, e.g.
+    ``"2.47"``. A typed target is recoverable in that case. Never convert a
+    boolean, an expression, a unit-bearing value, NaN, or infinity into a point.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value):
+            return None
+    elif not isinstance(value, (int, float)):
+        return None
     try:
-        return math.isfinite(float(value))
-    except OverflowError:
-        return False
+        number = float(value)
+    except (ValueError, OverflowError, TypeError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _finite_number(value: object) -> bool:
+    """Return whether the value is already a finite JSON number."""
+    return (not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and _coerce_finite_number(value) is not None)
 
 
 def _interval_problem(parsed: dict) -> str | None:
-    """Why the model's interval cannot be used as given, or None when it can."""
-    interval = parsed.get("interval") or {}
-    lo, hi = interval.get("lo"), interval.get("hi")
-    if lo is None or hi is None:
+    """Describe an interval problem without discarding a valid point forecast."""
+    interval = parsed.get("interval")
+    if not isinstance(interval, dict):
         return "interval missing"
-    # A NaN, infinite or too-large bound counts as a missing bound: the scorer refuses a
-    # non-finite number for the whole submission, and the model's point stays usable.
-    if not (_finite_number(lo) and _finite_number(hi)):
-        return "interval bound is not a finite number"
+    lo = _coerce_finite_number(interval.get("lo"))
+    hi = _coerce_finite_number(interval.get("hi"))
+    if lo is None or hi is None:
+        return "interval missing or non-finite"
     if lo > hi:
         return "interval lo is above hi"
+    point = _coerce_finite_number(parsed.get("point_forecast"))
+    if point is not None and not lo <= point <= hi:
+        return "interval excludes point forecast"
     return None
 
 
 def _safe_interval(parsed: dict, level: float, point: float | None) -> dict:
     if _interval_problem(parsed) is None:
         interval = parsed["interval"]
-        return {"level": level, "lo": float(interval["lo"]), "hi": float(interval["hi"])}
-    # Fallback: wide symmetric band around the point forecast (or zero). A missing
-    # lo/hi is not a per-entity coverage penalty -- it fails g1_schema and the WHOLE
-    # submission is scored t4.schema_invalid at W = -0.27 -- so any sane band beats none.
-    center = float(point) if isinstance(point, (int, float)) else 0.0
+        lo = _coerce_finite_number(interval["lo"])
+        hi = _coerce_finite_number(interval["hi"])
+        if lo is not None and hi is not None:
+            return {"level": level, "lo": lo, "hi": hi}
+    # The output schema rejects a missing interval. Preserve the model's point
+    # forecast even when its band is malformed or excludes that point.
+    center = point if point is not None and math.isfinite(point) else 0.0
     half = max(abs(center) * 0.5, 1.0)
     return {"level": level, "lo": center - half, "hi": center + half}
 
@@ -379,12 +415,9 @@ def _fallback_claims(
 
 
 def _require_finite(value: object, what: str) -> None:
-    """A NaN or infinite point forecast makes the reply unusable (the scorer refuses it).
-
-    ``float`` of an integer too large for a float raises OverflowError, also an unusable reply.
-    """
-    if isinstance(value, (int, float)) and not math.isfinite(float(value)):
-        raise ValueError(f"model reply carries a non-finite {what}")
+    """Reject invalid numeric values; allow a truly absent optional value."""
+    if value is not None and _coerce_finite_number(value) is None:
+        raise ValueError(f"model reply carries an unusable {what}")
 
 
 def _fallback_prediction(
@@ -431,7 +464,7 @@ def _prediction_from_reply(
 
     point = parsed.get("point_forecast")
     _require_finite(point, "point_forecast")
-    point_value = float(point) if isinstance(point, (int, float)) else None
+    point_value = _coerce_finite_number(point)
     if point_value is None and target.get("type") in ("regression", "ranking"):
         # The scorer refuses the whole submission when this row has no number.
         raise ValueError("model reply carries no numeric point_forecast")
