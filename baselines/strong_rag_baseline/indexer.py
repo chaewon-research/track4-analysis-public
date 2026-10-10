@@ -10,7 +10,7 @@ for free — no separate span search needed for chunk-level citations.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 _MANIFEST_NAME = "manifest.json"
@@ -30,6 +30,10 @@ class IndexedCorpus:
     chunks: list[Chunk]
     doc_texts: dict[str, str]  # doc_id -> full joined text (for span finding)
     doc_dates: dict[str, str | None]
+    # Manifest-declared document/entity bindings. Empty for corpora whose
+    # manifest does not declare entity_ids.
+    doc_entity_ids: dict[str, frozenset[str]] = field(default_factory=dict)
+    shared_doc_ids: frozenset[str] = field(default_factory=frozenset)
 
 
 def _iter_span_texts(doc: dict) -> list[str]:
@@ -46,7 +50,42 @@ def build_index(corpus_dir: str | Path) -> IndexedCorpus:
     chunks: list[Chunk] = []
     doc_texts: dict[str, str] = {}
     doc_dates: dict[str, str | None] = {}
-    for path in sorted(Path(corpus_dir).glob("*.json")):
+    doc_entity_ids: dict[str, frozenset[str]] = {}
+    shared_doc_ids: set[str] = set()
+
+    corpus_path = Path(corpus_dir)
+
+    # The public corpus manifest is the authoritative document/entity binding
+    # when it supplies entity_ids. Keep it with the index so retrieval can
+    # avoid giving one roster entity another entity's document.
+    entity_ids_by_stem: dict[str, frozenset[str]] = {}
+    shared_stems: set[str] = set()
+    manifest_path = corpus_path / _MANIFEST_NAME
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for item in manifest.get("files", []):
+            if not isinstance(item, dict):
+                continue
+            raw_path = item.get("path")
+            if not isinstance(raw_path, str):
+                continue
+
+            stem = Path(raw_path).stem
+
+            raw_entity_ids = item.get("entity_ids")
+            if isinstance(raw_entity_ids, list):
+                ids = frozenset(
+                    str(entity_id)
+                    for entity_id in raw_entity_ids
+                    if isinstance(entity_id, str) and entity_id
+                )
+                if ids:
+                    entity_ids_by_stem[stem] = ids
+
+            if item.get("shared") is True:
+                shared_stems.add(stem)
+
+    for path in sorted(corpus_path.glob("*.json")):
         if path.name == _MANIFEST_NAME:
             continue
         doc = json.loads(path.read_text(encoding="utf-8"))
@@ -69,4 +108,17 @@ def build_index(corpus_dir: str | Path) -> IndexedCorpus:
             offset += len(text) + 1  # +1 for the joining space
         doc_texts[doc_id] = " ".join(parts)
         doc_dates[doc_id] = doc_date
-    return IndexedCorpus(chunks=chunks, doc_texts=doc_texts, doc_dates=doc_dates)
+
+        manifest_ids = entity_ids_by_stem.get(path.stem)
+        if manifest_ids:
+            doc_entity_ids[doc_id] = manifest_ids
+        if path.stem in shared_stems:
+            shared_doc_ids.add(doc_id)
+
+    return IndexedCorpus(
+        chunks=chunks,
+        doc_texts=doc_texts,
+        doc_dates=doc_dates,
+        doc_entity_ids=doc_entity_ids,
+        shared_doc_ids=frozenset(shared_doc_ids),
+    )

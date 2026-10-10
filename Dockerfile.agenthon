@@ -1,0 +1,27 @@
+FROM python:3.13-slim
+
+LABEL qfbench2.interface_version="2.0"
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the pinned shared competition toolkit first.
+RUN pip install --no-cache-dir \
+    "qfbench2-common @ git+https://github.com/Agenthon-2026/Agenthon2026-public.git@v2.5.1#subdirectory=common"
+
+# Install only the Track 4 code needed by the numeric grounding guard.
+COPY pyproject.toml ./
+COPY qfbench2_track_analysis ./qfbench2_track_analysis
+COPY faithfulness ./faithfulness
+
+RUN pip install --no-cache-dir .
+
+# Copy our actual competition agent.
+COPY baselines/strong_rag_baseline ./baselines/strong_rag_baseline
+
+# Agenthon passes "analyze" as the first argument after the image.
+ENTRYPOINT ["python", "-m", "baselines.strong_rag_baseline.cli"]
+CMD ["analyze", "--help"]

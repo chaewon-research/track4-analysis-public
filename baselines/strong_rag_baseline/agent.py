@@ -12,7 +12,9 @@ import json
 import math
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from qfbench2_track_analysis.numeric import claim_number_status
 
 from .client import ModelBudgetExhausted, ModelCallError, ModelClient
 from .indexer import Chunk, IndexedCorpus
@@ -31,6 +33,126 @@ _QUERY_SUFFIX = "results revenue earnings guidance outlook growth"
 #: a real passage, short enough to stay inside one excerpt (chunks run to 1M characters).
 _FALLBACK_QUOTE_CHARS = 200
 
+# Whole SEC filings can be hundreds of thousands of characters long.  The
+# corpus index keeps those large spans because their offsets are authoritative,
+# but sending several complete filings to the model can overwhelm its context
+# window.  Split only the model-facing retrieval into small overlapping
+# windows while preserving each window's absolute corpus offsets.
+_PROMPT_WINDOW_CHARS = 3500
+_PROMPT_WINDOW_OVERLAP = 500
+
+
+def _prompt_windows(chunks: list[Chunk]) -> list[Chunk]:
+    """Split large retrieved chunks into citation-safe overlapping windows."""
+    windows: list[Chunk] = []
+    step = _PROMPT_WINDOW_CHARS - _PROMPT_WINDOW_OVERLAP
+
+    for chunk in chunks:
+        if len(chunk.text) <= _PROMPT_WINDOW_CHARS:
+            windows.append(chunk)
+            continue
+
+        for rel_start in range(0, len(chunk.text), step):
+            rel_end = min(rel_start + _PROMPT_WINDOW_CHARS, len(chunk.text))
+            text = chunk.text[rel_start:rel_end]
+
+            if text.strip():
+                windows.append(
+                    Chunk(
+                        doc_id=chunk.doc_id,
+                        doc_date=chunk.doc_date,
+                        span_start=chunk.span_start + rel_start,
+                        span_end=chunk.span_start + rel_end,
+                        text=text,
+                    )
+                )
+
+            if rel_end >= len(chunk.text):
+                break
+
+    return windows
+
+
+def _focused_prompt_chunks(
+    chunks: list[Chunk],
+    query: str,
+    cutoff_date: str,
+    top_k: int,
+) -> list[Chunk]:
+    """Rerank small windows from the initially retrieved documents."""
+    candidates = _prompt_windows(chunks)
+    if not candidates:
+        return []
+
+    reranked = BM25Index(candidates, cutoff_date).search(query, top_k)
+    if reranked:
+        return [item.chunk for item in reranked]
+
+    return candidates[:top_k]
+
+
+
+def _entity_bound_docs(
+    index: BM25Index,
+    corpus: IndexedCorpus,
+    entity: dict,
+    query: str,
+    top_k: int,
+) -> list[Chunk]:
+    """Prefer authoritative entity-bound documents before global BM25.
+
+    Priority:
+      1. corpus manifest entity_ids binding;
+      2. SEC CIK encoded in the document ID;
+      3. ordinary corpus-wide BM25.
+    """
+    entity_id = str(entity.get("entity_id", ""))
+
+    # Public corpus manifests can explicitly bind documents to roster entities.
+    # When such a binding exists, do not let another entity's document compete.
+    if entity_id and corpus.doc_entity_ids:
+        matched = [
+            chunk
+            for chunk in index.chunks
+            if entity_id in corpus.doc_entity_ids.get(
+                chunk.doc_id, frozenset()
+            )
+        ]
+        if matched:
+            # `matched` came from index.chunks, so the cutoff was already
+            # enforced. Still run BM25 inside the bound subset rather than
+            # bypassing search entirely. This preserves the normal
+            # no-retrieval fallback behavior while preventing other entities'
+            # documents from competing.
+            bound_index = BM25Index(matched, "9999-12-31")
+            return [
+                item.chunk
+                for item in bound_index.search(query, top_k)
+            ]
+
+    # SEC fallback: task rows expose a CIK and EDGAR doc IDs encode it.
+    cik = re.sub(r"\D", "", str(entity.get("cik", "")))
+
+    if cik:
+        matched = [
+            chunk
+            for chunk in index.chunks
+            if cik in re.sub(r"\D", "", chunk.doc_id)
+        ]
+        if matched:
+            # `matched` came from index.chunks, so the cutoff was already
+            # enforced. Still run BM25 inside the bound subset rather than
+            # bypassing search entirely. This preserves the normal
+            # no-retrieval fallback behavior while preventing other entities'
+            # documents from competing.
+            bound_index = BM25Index(matched, "9999-12-31")
+            return [
+                item.chunk
+                for item in bound_index.search(query, top_k)
+            ]
+
+    return [item.chunk for item in index.search(query, top_k)]
+
 
 @dataclass
 class EntityResult:
@@ -45,19 +167,58 @@ class EntityResult:
 
 
 def _parse_model_json(raw: str) -> dict:
-    """Extract the first JSON object from the model reply (tolerates fences)."""
-    match = _JSON_BLOCK.search(raw)
-    if match is None:
-        raise ValueError("model reply contains no JSON object")
-    return json.loads(match.group(0))
+    """Recover one prediction object even when extra text surrounds the reply.
+
+    Greedy ``{.*}`` fails on replies with multiple brace-delimited objects (for
+    example, analysis text followed by a JSON answer). ``raw_decode`` reads one
+    complete object at a time and does not join unrelated braces. We prefer the
+    first object that contains a prediction field, not an arbitrary example.
+    """
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", raw):
+        try:
+            candidate, _end = decoder.raw_decode(raw, match.start())
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(candidate, dict) and (
+            "point_forecast" in candidate or "label" in candidate
+        ):
+            return candidate
+    raise ValueError("model reply contains no usable prediction JSON object")
 
 
-def _entity_query(entity: dict) -> str:
-    parts = [
-        str(entity.get(key, ""))
-        for key in ("name", "entity_id", "sector", "series_id", "description")
-    ]
-    return " ".join(p for p in parts if p) + " " + _QUERY_SUFFIX
+def _entity_query(entity: dict, family: str = "") -> str:
+    # Use the richest entity-specific metadata available so BM25 retrieves
+    # evidence for the correct company / macro series / instrument.
+    keys = (
+        "name",
+        "entity_id",
+        "ticker",
+        "symbol",
+        "sector",
+        "industry",
+        "cik",
+        "series_id",
+        "series_name",
+        "agency",
+        "description",
+        "ref_month",
+    )
+    parts = [str(entity.get(key, "")) for key in keys if entity.get(key)]
+
+    if family == "macro_revision_direction":
+        suffix = "revision estimate vintage release"
+    elif family == "auction_demand":
+        suffix = "Treasury auction bid cover ratio tendered accepted demand"
+    elif family == "credit_event":
+        suffix = (
+            "liquidity debt cash covenant default going concern "
+            "losses maturities solvency"
+        )
+    else:
+        suffix = _QUERY_SUFFIX
+
+    return " ".join(parts + [suffix])
 
 
 def _ground_claims(
@@ -76,7 +237,13 @@ def _ground_claims(
         if not isinstance(item, dict):
             dropped += 1
             continue
-        doc_id = item.get("doc_id", "")
+        doc_id = str(item.get("doc_id", "")).strip()
+        # Some OpenAI-compatible local models echo the prompt syntax as
+        # "doc_id=EDGAR_..." rather than the bare identifier. This is an
+        # unambiguous formatting error, so normalize only that exact prefix.
+        if doc_id.startswith("doc_id="):
+            doc_id = doc_id[len("doc_id="):].strip()
+
         quote = str(item.get("quote", ""))
         claim_text = str(item.get("claim", "")).strip()
         doc_text = corpus.doc_texts.get(doc_id)
@@ -93,6 +260,27 @@ def _ground_claims(
                 dropped += 1
                 continue
             span = (chunk.span_start, chunk.span_end)
+
+        span_text = doc_text[span[0]:span[1]]
+
+        # Match the scorer's deterministic numeric backstop. If the model
+        # states a figure that is anchored nowhere in its cited passage,
+        # replace the risky claim with a short verbatim claim from that
+        # already-grounded span.
+        # Match scorer 5.2.x: every numeric figure in an extractive
+        # evidence claim must be anchored in its cited passage. If any figure
+        # is unsupported, replace the risky model-written claim with a short
+        # verbatim claim from the already-grounded span.
+        if (
+            claim_number_status(
+                claim_text,
+                [span_text],
+                rule="every",
+            )
+            == "unanchored"
+        ):
+            claims.append(_verbatim_claim(doc_id, span_text, span[0]))
+            continue
 
         claims.append(
             {
@@ -117,39 +305,62 @@ def _best_chunk(quote: str, chunks: list[Chunk]) -> Chunk | None:
     return best[1] if best and best[0] > 0 else None
 
 
-def _finite_number(value: object) -> bool:
-    """A number that converts to a finite float (not NaN, not infinite, not too large)."""
-    if not isinstance(value, (int, float)):
-        return False
+def _coerce_finite_number(value: object) -> float | None:
+    """Accept finite JSON numbers and plainly formatted numeric strings only.
+
+    Some House-compatible models serialize a numeric value as a string, e.g.
+    ``"2.47"``. A typed target is recoverable in that case. Never convert a
+    boolean, an expression, a unit-bearing value, NaN, or infinity into a point.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value):
+            return None
+    elif not isinstance(value, (int, float)):
+        return None
     try:
-        return math.isfinite(float(value))
-    except OverflowError:
-        return False
+        number = float(value)
+    except (ValueError, OverflowError, TypeError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _finite_number(value: object) -> bool:
+    """Return whether the value is already a finite JSON number."""
+    return (not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and _coerce_finite_number(value) is not None)
 
 
 def _interval_problem(parsed: dict) -> str | None:
-    """Why the model's interval cannot be used as given, or None when it can."""
-    interval = parsed.get("interval") or {}
-    lo, hi = interval.get("lo"), interval.get("hi")
-    if lo is None or hi is None:
+    """Describe an interval problem without discarding a valid point forecast."""
+    interval = parsed.get("interval")
+    if not isinstance(interval, dict):
         return "interval missing"
-    # A NaN, infinite or too-large bound counts as a missing bound: the scorer refuses a
-    # non-finite number for the whole submission, and the model's point stays usable.
-    if not (_finite_number(lo) and _finite_number(hi)):
-        return "interval bound is not a finite number"
+    lo = _coerce_finite_number(interval.get("lo"))
+    hi = _coerce_finite_number(interval.get("hi"))
+    if lo is None or hi is None:
+        return "interval missing or non-finite"
     if lo > hi:
         return "interval lo is above hi"
+    point = _coerce_finite_number(parsed.get("point_forecast"))
+    if point is not None and not lo <= point <= hi:
+        return "interval excludes point forecast"
     return None
 
 
 def _safe_interval(parsed: dict, level: float, point: float | None) -> dict:
     if _interval_problem(parsed) is None:
         interval = parsed["interval"]
-        return {"level": level, "lo": float(interval["lo"]), "hi": float(interval["hi"])}
-    # Fallback: wide symmetric band around the point forecast (or zero). A missing
-    # lo/hi is not a per-entity coverage penalty -- it fails g1_schema and the WHOLE
-    # submission is scored t4.schema_invalid at W = -0.27 -- so any sane band beats none.
-    center = float(point) if isinstance(point, (int, float)) else 0.0
+        lo = _coerce_finite_number(interval["lo"])
+        hi = _coerce_finite_number(interval["hi"])
+        if lo is not None and hi is not None:
+            return {"level": level, "lo": lo, "hi": hi}
+    # The output schema rejects a missing interval. Preserve the model's point
+    # forecast even when its band is malformed or excludes that point.
+    center = point if point is not None and math.isfinite(point) else 0.0
     half = max(abs(center) * 0.5, 1.0)
     return {"level": level, "lo": center - half, "hi": center + half}
 
@@ -204,12 +415,9 @@ def _fallback_claims(
 
 
 def _require_finite(value: object, what: str) -> None:
-    """A NaN or infinite point forecast makes the reply unusable (the scorer refuses it).
-
-    ``float`` of an integer too large for a float raises OverflowError, also an unusable reply.
-    """
-    if isinstance(value, (int, float)) and not math.isfinite(float(value)):
-        raise ValueError(f"model reply carries a non-finite {what}")
+    """Reject invalid numeric values; allow a truly absent optional value."""
+    if value is not None and _coerce_finite_number(value) is None:
+        raise ValueError(f"model reply carries an unusable {what}")
 
 
 def _fallback_prediction(
@@ -254,9 +462,21 @@ def _prediction_from_reply(
     if labels and label not in labels:
         label = labels[0]  # deterministic fallback for off-vocabulary labels
 
+    # Preserve the old behavior for malformed interval *objects*: the existing
+    # unit tests require a whole-row fallback in that case. Missing bounds or
+    # invalid numeric bounds can still use the valid-point interval fallback.
+    if "interval" in parsed and not isinstance(parsed["interval"], dict):
+        raise ValueError("model reply interval is not an object")
+
     point = parsed.get("point_forecast")
-    _require_finite(point, "point_forecast")
-    point_value = float(point) if isinstance(point, (int, float)) else None
+    # A numeric point is optional for pure classification tasks. In particular,
+    # placeholder strings such as "n/a" must be omitted, not turn the entire
+    # otherwise-usable label prediction into a fallback row.
+    if target.get("type") in ("regression", "ranking"):
+        _require_finite(point, "point_forecast")
+    elif isinstance(point, (int, float)):
+        _require_finite(point, "point_forecast")
+    point_value = _coerce_finite_number(point)
     if point_value is None and target.get("type") in ("regression", "ranking"):
         # The scorer refuses the whole submission when this row has no number.
         raise ValueError("model reply carries no numeric point_forecast")
@@ -292,6 +512,108 @@ def _prediction_from_reply(
     return prediction, dropped, fallback_claim, interval_problem
 
 
+def _focus_cpi_component_chunks(
+    chunks: list[Chunk],
+    entity: dict,
+) -> list[Chunk]:
+    """Focus shared CPI documents on the requested component.
+
+    CPI component tasks can contain shared tables/releases covering many
+    components. Smaller models can latch onto a nearby component or a number
+    expressed in different units. Preserve exact document offsets while
+    exposing the locally relevant part of each source.
+    """
+    name = str(entity.get("name", "")).strip()
+    series = str(entity.get("series_fred", "")).strip()
+
+    if not name and not series:
+        return chunks
+
+    focused: list[Chunk] = []
+
+    for chunk in chunks:
+        text = chunk.text
+
+        if not text:
+            focused.append(chunk)
+            continue
+
+        # The frozen ALFRED CPI table includes one derived summary line per
+        # component. Prefer that concise, component-specific history whenever
+        # it is available.
+        if name:
+            prefix = f"- {name}:".lower()
+            cursor = 0
+            note_span = None
+
+            for line in text.splitlines(keepends=True):
+                stripped = line.lstrip()
+                if stripped.lower().startswith(prefix):
+                    leading = len(line) - len(stripped)
+                    start = cursor + leading
+                    end = cursor + len(line.rstrip("\r\n"))
+                    note_span = (start, end)
+                    break
+                cursor += len(line)
+
+            if note_span is not None:
+                start, end = note_span
+                focused.append(
+                    replace(
+                        chunk,
+                        text=text[start:end],
+                        span_start=chunk.span_start + start,
+                        span_end=chunk.span_start + end,
+                    )
+                )
+                continue
+
+        # Generic fallback for BLS releases or held-out CPI documents:
+        # center the excerpt around the latest occurrence of the component
+        # name or its FRED series identifier.
+        lowered = text.lower()
+        anchors: list[int] = []
+
+        for needle in (name, series):
+            needle = needle.lower().strip()
+            if not needle:
+                continue
+            pos = lowered.rfind(needle)
+            if pos >= 0:
+                anchors.append(pos)
+
+        if not anchors:
+            focused.append(chunk)
+            continue
+
+        anchor = max(anchors)
+        start = max(0, anchor - 500)
+        end = min(len(text), anchor + 1000)
+
+        previous_newline = text.rfind("\n", 0, start)
+        if previous_newline >= 0:
+            start = previous_newline + 1
+
+        next_newline = text.find("\n", end)
+        if next_newline >= 0:
+            end = next_newline
+
+        if end <= start:
+            focused.append(chunk)
+            continue
+
+        focused.append(
+            replace(
+                chunk,
+                text=text[start:end],
+                span_start=chunk.span_start + start,
+                span_end=chunk.span_start + end,
+            )
+        )
+
+    return focused
+
+
 def run_entity(
     task: dict,
     entity: dict,
@@ -300,8 +622,54 @@ def run_entity(
     client: ModelClient,
     top_k: int,
 ) -> EntityResult:
-    retrieved = [s.chunk for s in index.search(_entity_query(entity), top_k)]
-    entity_id = entity.get("entity_id", "")
+    query = _entity_query(entity, task.get("family", ""))
+    retrieved_docs = _entity_bound_docs(
+        index, corpus, entity, query, top_k
+    )
+    retrieved = _focused_prompt_chunks(
+        retrieved_docs,
+        query,
+        task.get("cutoff_date", ""),
+        top_k,
+    )
+
+    # CPI component tasks sometimes include gasoline market-price series as a
+    # useful leading indicator for gasoline/energy. For unrelated components,
+    # that differently-scaled series can distract smaller models into
+    # predicting dollars-per-gallon instead of CPI month-over-month percent.
+    family = str(task.get("family", "")).lower()
+    entity_id = str(entity.get("entity_id", ""))
+    entity_name = str(entity.get("name", "")).strip().lower()
+
+    # A gasoline-price proxy is directly useful for gasoline, the aggregate
+    # energy index, and headline/all-items CPI. Exclude it from unrelated CPI
+    # components so a differently-scaled market-price series does not dominate
+    # the component forecast. Infer this from semantic metadata rather than
+    # public-unit entity IDs so the behavior transfers to held-out entities.
+    gasoline_proxy_relevant = (
+        "gasoline" in entity_name
+        or entity_name in {"energy", "energy index"}
+        or (
+            ("all items" in entity_name or "headline" in entity_name)
+            and "less food and energy" not in entity_name
+            and "core" not in entity_name
+        )
+    )
+
+    if family == "cpi_component_nowcast" and not gasoline_proxy_relevant:
+        filtered = [
+            chunk
+            for chunk in retrieved
+            if not (
+                "gasregw" in chunk.doc_id.lower()
+                or "regular gasoline retail price" in chunk.text.lower()
+            )
+        ]
+        if filtered:
+            retrieved = filtered
+
+    if family == "cpi_component_nowcast":
+        retrieved = _focus_cpi_component_chunks(retrieved, entity)
     try:
         raw = client.complete(
             SYSTEM_PROMPT, build_user_prompt(task, entity, retrieved)
