@@ -55,6 +55,30 @@ def build_user_prompt(
             continue
         lines.append(f"  {key}: {value}")
 
+    # The rate-curve family asks for a CHANGE in basis points, while the entity
+    # provides the starting YIELD LEVEL in percent. Keep the forecast quantity
+    # explicit for this family only; no numeric prediction is hard-coded.
+    if (
+        task.get("family") == "rate_curve_cross_section"
+        and target.get("name") == "yield_change_bps_intermeeting"
+        and target_type == "regression"
+    ):
+        lines.append(
+            "\nTREASURY YIELD-CHANGE FORECAST CHECK:\n"
+            "- Predict resolution yield MINUS cutoff yield for this maturity, "
+            "as a change in basis points (bps).\n"
+            "- start_yield_pct is the observed starting yield LEVEL in percent, "
+            "not the forecast of its change.\n"
+            "- Conversion: 1 percentage point equals 100 basis points. "
+            "If reasoning from an ending yield in percent, first subtract "
+            "start_yield_pct and multiply the difference by 100.\n"
+            "- Both point_forecast and interval lo/hi must be CHANGES in bps, "
+            "not levels in percent.\n"
+            "- Use maturity_years and the supplied pre-cutoff evidence to reason "
+            "about the expected repricing. A policy-rate change is not "
+            "automatically the same as a Treasury yield change at every maturity."
+        )
+
     lines.append("\nEVIDENCE EXCERPTS (cite only these):")
     for i, chunk in enumerate(retrieved, 1):
         lines.append(f"[{i}] doc_id={chunk.doc_id} (doc_date={chunk.doc_date})")
