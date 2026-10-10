@@ -55,14 +55,55 @@ def build_user_prompt(
             continue
         lines.append(f"  {key}: {value}")
 
+    # The rate-curve family asks for a CHANGE in basis points, while the entity
+    # provides the starting YIELD LEVEL in percent. Keep the forecast quantity
+    # explicit for this family only; no numeric prediction is hard-coded.
+    if (
+        task.get("family") == "rate_curve_cross_section"
+        and target.get("name") == "yield_change_bps_intermeeting"
+        and target_type == "regression"
+    ):
+        lines.append(
+            "\nTREASURY YIELD-CHANGE FORECAST CHECK:\n"
+            "- Predict resolution yield MINUS cutoff yield for this maturity, "
+            "as a change in basis points (bps).\n"
+            "- start_yield_pct is the observed starting yield LEVEL in percent, "
+            "not the forecast of its change.\n"
+            "- Conversion: 1 percentage point equals 100 basis points. "
+            "If reasoning from an ending yield in percent, first subtract "
+            "start_yield_pct and multiply the difference by 100.\n"
+            "- Both point_forecast and interval lo/hi must be CHANGES in bps, "
+            "not levels in percent.\n"
+            "- Use maturity_years and the supplied pre-cutoff evidence to reason "
+            "about the expected repricing. A policy-rate change is not "
+            "automatically the same as a Treasury yield change at every maturity."
+        )
+
     lines.append("\nEVIDENCE EXCERPTS (cite only these):")
     for i, chunk in enumerate(retrieved, 1):
         lines.append(f"[{i}] doc_id={chunk.doc_id} (doc_date={chunk.doc_date})")
         lines.append(f'"""{chunk.text}"""')
 
+    # Keep the requested output contract extremely explicit. Smaller local
+    # models in particular can otherwise copy exhibit numbers such as "10.1"
+    # as document IDs or treat required classification fields as optional.
+    if target_type in ("regression", "ranking"):
+        point_instruction = "REQUIRED finite number; never null"
+    elif target_type == "classification":
+        point_instruction = (
+            "number if the TASK requests a numeric point_forecast/probability; "
+            "otherwise null"
+        )
+    else:
+        point_instruction = "number or null"
+
     schema = {
-        "label": "string or null",
-        "point_forecast": "number or null",
+        "label": (
+            "EXACTLY one ALLOWED LABEL; never null"
+            if target_type == "classification"
+            else "string or null"
+        ),
+        "point_forecast": point_instruction,
         "interval": {
             "level": interval_level,
             "lo": "number",
@@ -70,9 +111,9 @@ def build_user_prompt(
         },
         "evidence": [
             {
-                "doc_id": "doc_id of the excerpt the quote comes from",
-                "quote": "verbatim substring copied from that excerpt",
-                "claim": "one factual sentence the quote directly supports",
+                "doc_id": "copy an exact doc_id shown in EVIDENCE EXCERPTS",
+                "quote": "verbatim substring copied from that same excerpt",
+                "claim": "one factual sentence directly supported by the quote",
             }
         ],
     }
@@ -81,10 +122,45 @@ def build_user_prompt(
     )
     lines.append(json.dumps(schema, indent=2))
     lines.append(f"\n{_TARGET_INSTRUCTIONS.get(target_type, _TARGET_INSTRUCTIONS['classification'])}")
+    valid_doc_ids = ", ".join(dict.fromkeys(c.doc_id for c in retrieved))
+    lines.append(
+        "\nSTRICT OUTPUT RULES:\n"
+        "- Never return null for label on a classification task.\n"
+        "- For regression and ranking tasks, point_forecast MUST be a finite "
+        "number and MUST NEVER be null.\n"
+        "- Copy doc_id EXACTLY from an EVIDENCE EXCERPT header. Do not add "
+        '"doc_id=", an excerpt number, an exhibit number, or any other prefix.\n'
+        "- Return exactly ONE evidence entry: the strongest directly supported "
+        "pre-cutoff fact relevant to your prediction.\n"
+        "- Choose the evidence quote FIRST, then write the claim as a conservative "
+        "restatement of facts explicitly stated in that quote.\n"
+        "- The evidence quote must be copied verbatim from that same document.\n"
+        "- Do NOT add a number, date, direction, causal relation, or factual conclusion "
+        "to the claim unless that information is explicitly stated in the quote.\n"
+        "- If the claim contains a number or date, that same number or date MUST appear "
+        "verbatim in the evidence quote.\n"
+        "- Do NOT use an ENTITY field itself as evidence unless the same fact also "
+        "appears in the quoted EVIDENCE EXCERPT.\n"
+        "- Do NOT combine facts from different excerpts into one claim.\n"
+        "- Prefer a specific observed pre-cutoff fact over an inferred explanation.\n"
+        "- lo must be <= point_forecast <= hi whenever point_forecast is numeric.\n"
+        f"- Valid doc_ids for this request: {valid_doc_ids}"
+    )
     lines.append(
         f'The "interval" must be your {int(interval_level * 100)}% prediction interval for the '
         "numeric target: wide enough that you expect the realized value to fall inside it "
-        f"{int(interval_level * 100)}% of the time, and no wider. "
-        "Give 2 to 4 evidence entries. Each claim must be fully supported by its quote alone."
+        f"{int(interval_level * 100)}% of the time, and no wider."
     )
+
+    task_text = str(task.get("prompt", "")).lower()
+    if (
+        target_type == "classification"
+        and "point_forecast" in task_text
+        and "probability" in task_text
+    ):
+        lines.append(
+            'This TASK explicitly defines point_forecast as a probability. '
+            'Therefore point_forecast MUST be a number from 0 to 1, never null. '
+            'The interval must satisfy 0 <= lo <= point_forecast <= hi <= 1.'
+        )
     return "\n".join(lines)
